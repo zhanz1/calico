@@ -20,15 +20,10 @@ Calico election code.
 """
 import os
 import random
-import re
 import socket
-import sys
+import time
 
 from etcd3gw.exceptions import Etcd3Exception
-
-import eventlet
-
-import greenlet
 
 from oslo_config import cfg
 
@@ -36,6 +31,7 @@ from oslo_log import log
 
 from networking_calico import etcdv3
 from networking_calico.common import config as calico_config
+from networking_calico.procutils import exit
 
 
 LOG = log.getLogger(__name__)
@@ -65,7 +61,7 @@ class RestartElection(Exception):
 
 
 class Elector(object):
-    def __init__(self, server_id, election_key, old_key=None, interval=30, ttl=60):
+    def __init__(self, server_id, election_key, is_master, old_key=None, interval=30, ttl=60):
         """Class that manages elections.
 
         :param server_id: Server ID. Must be unique to this server, and should
@@ -73,6 +69,9 @@ class Elector(object):
                           hostname)
         :param election_key: The etcd key used for the election - e.g.
                              "/calico/v2/no-region/election"
+        :param is_master: Process-shared value, used by other processes to
+                          determine whether the current neutron-server
+                          instance is the master.
         :param old_key: A legacy key that does not determine the election, but
                         that we write whenever we write the election_key - e.g.
                              "/calico/v1/election"
@@ -91,6 +90,7 @@ class Elector(object):
         self._interval = int(interval)
         self._ttl = int(ttl)
         self._stopped = False
+        self._is_master = is_master
 
         if self._interval <= 0:
             raise ValueError("Interval %r is <= 0" % interval)
@@ -100,11 +100,9 @@ class Elector(object):
 
         # Is this the master? To start with, no
         self._master = False
+        self._is_master.value = 0
 
-        # Keep the greenlet ID handy to ease UT.
-        self._greenlet = eventlet.spawn(self._run)
-
-    def _run(self):
+    def run(self):
         """Main election thread run routine.
 
         The slightly artificial split between this and _vote is mostly so that
@@ -122,10 +120,7 @@ class Elector(object):
                 # retry.
                 retry_time = 1 + random.random()
                 LOG.info("Retrying leader election in %.1f seconds", retry_time)
-                eventlet.sleep(retry_time)
-        except ElectorStopped:
-            LOG.info("Elector told to stop.")
-            raise
+                time.sleep(retry_time)
         except BaseException as e:
             # Election greenlet failed. Log but reraise.
             LOG.exception("Election greenlet exiting: %r", e)
@@ -135,7 +130,7 @@ class Elector(object):
             # driver does not function correctly once this leader
             # election thread has died.  Hence our best option is to
             # restart the whole Neutron server.
-            sys.exit(1)
+            exit(1)
             # Just in case we're still here - reraise the exception.
             raise
         finally:
@@ -156,10 +151,6 @@ class Elector(object):
             return
 
         LOG.debug("ID of elected master is : %s", value)
-        if value:
-            # If we happen to be on the same server, check if the master
-            # process is still alive.
-            self._check_master_process(value)
 
         while not self._stopped:
             # We know another instance is the master. Wait until something
@@ -207,42 +198,6 @@ class Elector(object):
                 )
                 self._become_master()
 
-    def _check_master_process(self, master_id):
-        """_check_master_process
-
-        If the master happens to be on our host, checks if its process is
-        still alive.  If it is not, cleans up the now-stale election key.
-
-        :param master_id: Value loaded from the election key.
-        """
-        # Defensive. In case we ever change the master ID format, only parse
-        # it if it looks like what we expect.
-        match = re.match(r"^(?P<host>[^:]+):(?P<pid>\d+)$", master_id)
-        if not match:
-            LOG.warning("Unable to parse master ID: %r.", master_id)
-            return
-        host = match.group("host")
-        pid = int(match.group("pid"))
-        LOG.debug("Parsed key as host = %s, PID = %s", host, pid)
-        if host == self._server_id:
-            # Check if the PID is still running.
-            LOG.debug("Previous master was on this server %s", host)
-            if os.path.exists("/proc/%s" % pid):
-                LOG.debug("Master still running")
-            else:
-                LOG.warning(
-                    "Master was on this server but cannot find its "
-                    "PID in /proc.  Removing stale election key."
-                )
-                try:
-                    deleted = etcdv3.delete(self._key, existing_value=master_id)
-                except Etcd3Exception as e:
-                    self._log_exception("remove stale key from dead master", e)
-                    deleted = False
-
-                if not deleted:
-                    raise RestartElection()
-
     def _become_master(self):
         """_become_master
 
@@ -260,12 +215,14 @@ class Elector(object):
             self._master = etcdv3.put(
                 self._key, self.id_string, lease=ttl_lease, mod_revision="0"
             )
+            self._is_master.value = time.time()
         except Exception as e:
             # We could be smarter about what exceptions we allow, but any kind
             # of error means we should give up, and safer to have a broad
             # except here. Log and reconnect.
             self._log_exception("become master", e)
             self._master = False
+            self._is_master.value = 0
 
         if not self._master:
             LOG.info("Race: someone else beat us to be master")
@@ -294,6 +251,7 @@ class Elector(object):
                     ):
                         LOG.warning("Key changed or deleted; restart election")
                         raise RestartElection()
+                    self._is_master.value = time.time()
                     LOG.debug("Refreshed master role, TTL now is %d", ttl)
                 except RestartElection:
                     raise
@@ -307,10 +265,11 @@ class Elector(object):
                 # If there's a legacy election key, try to write that now too.
                 self._write_old_key(ttl_lease)
 
-                eventlet.sleep(self._interval)
+                time.sleep(self._interval)
         finally:
             LOG.info("Exiting master refresh loop, no longer the master")
             self._master = False
+            self._is_master.value = 0
         raise RestartElection()
 
     def _write_old_key(self, lease):
@@ -348,6 +307,7 @@ class Elector(object):
 
     def _attempt_step_down(self):
         self._master = False
+        self._is_master.value = 0
         try:
             etcdv3.delete(self._key, existing_value=self.id_string)
         except Exception:
@@ -355,33 +315,5 @@ class Elector(object):
             # will expire anyway.
             LOG.exception("Failed to step down as master.  Ignoring.")
 
-    def master(self):
-        """Am I the master?
-
-        returns: True if this is the master.
-        """
-        return self._master and not self._stopped
-
     def stop(self):
         self._stopped = True
-        if self._greenlet and not self._greenlet.dead:
-            self._greenlet.kill(ElectorStopped(), None, None)
-            try:
-                # It should die very quickly.
-                eventlet.with_timeout(10, self._greenlet.wait)
-            except eventlet.Timeout:
-                # Looks like we've leaked the greenlet somehow.
-                LOG.error("Timeout while waiting for the greenlet to die.")
-                raise RuntimeError("Failed to kill Elector greenlet.")
-            except ElectorStopped:
-                pass  # Expected
-
-
-class ElectorStopped(greenlet.GreenletExit):
-    """ElectorStopped
-
-    Custom exception used to stop our Elector.  Used to distinguish our
-    kill() call from any other potential GreenletExit exception.
-    """
-
-    pass

@@ -1,3 +1,41 @@
+import eventlet
+import eventlet.hubs.timer
+import threading
+import traceback
+import greenlet
+
+original_timer_init = eventlet.hubs.timer.Timer.__init__
+
+def debug_timer_init(self, *args, **kwargs):
+    original_timer_init(self, *args, **kwargs)
+
+    self._scheduled_by = traceback.format_stack()[:-1]
+    self._scheduled_in_thread = threading.get_ident()
+
+eventlet.hubs.timer.Timer.__init__ = debug_timer_init
+
+
+original_timer_call = eventlet.hubs.timer.Timer.__call__
+
+def debug_timer_call(self, *args, **kwargs):
+    try:
+        return original_timer_call(self, *args, **kwargs)
+    except greenlet.error as e:
+        if "cannot switch to a different thread" in str(e):
+            print("\n" + "-"*60)
+            print("CROSS-THREAD SWITCH DETECTED")
+            print(f"Hub crashing in OS Thread: {threading.get_ident()}")
+
+            if hasattr(self, '_scheduled_in_thread'):
+                print(f"Switch was triggered by OS Thread: {self._scheduled_in_thread}")
+
+            if hasattr(self, '_scheduled_by'):
+                print("\n--- Traceback of the code that TRIGGERED the switch ---")
+                print("".join(self._scheduled_by))
+            print("!"*60 + "\n")
+        raise
+
+eventlet.hubs.timer.Timer.__call__ = debug_timer_call
 # -*- coding: utf-8 -*-
 #
 # Copyright (c) 2014, 2015 Metaswitch Networks
@@ -27,6 +65,7 @@
 import contextlib
 from datetime import datetime, timedelta
 import inspect
+import multiprocessing
 import os
 import re
 import threading
@@ -35,7 +74,6 @@ import uuid
 from functools import wraps
 
 import eventlet
-from eventlet.queue import PriorityQueue
 from eventlet.semaphore import Semaphore
 
 from keystoneauth1 import session
@@ -77,7 +115,10 @@ from networking_calico import datamodel_v3
 from networking_calico import etcdv3
 from networking_calico.common import config as calico_config
 from networking_calico.common import intern_string
-from networking_calico.logutils import logging_exceptions
+from networking_calico.logutils import (
+    logging_exceptions,
+    recreate_log_handler_locks_using_native_threading,
+)
 from networking_calico.monotonic import monotonic_time
 from networking_calico.plugins.ml2.drivers.calico import qos_driver
 from networking_calico.plugins.ml2.drivers.calico.election import Elector
@@ -89,7 +130,7 @@ from networking_calico.plugins.ml2.drivers.calico.endpoints import (
 from networking_calico.plugins.ml2.drivers.calico.policy import PolicySyncer
 from networking_calico.plugins.ml2.drivers.calico.status import StatusWatcher
 from networking_calico.plugins.ml2.drivers.calico.subnets import SubnetSyncer
-import networking_calico.plugins.ml2.drivers.calico.endpoint_syncer as worker
+import networking_calico.plugins.ml2.drivers.calico.workers as worker
 
 
 # Register [AGENT] options, which we need in order to successfully use
@@ -318,8 +359,7 @@ class CalicoMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
             {"port_filter": True, "mac_address": "00:61:fe:ed:ca:fe"},
         )
         # Let's start the process of switching to use native threading :)
-        from eventlet import patcher
-        self.native_threading = patcher.original("threading")
+        self.native_threading = eventlet.patcher.original("threading")
 
         qos_driver.register(self)
         # Lock to prevent concurrent initialisation.
@@ -328,6 +368,9 @@ class CalicoMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
         # properly, as needed, in _post_fork_init().
         self.db = None
         self.elector = None
+        # "d" = double. Used for storing time.time(). See
+        # https://docs.python.org/3/library/array.html#module-array
+        self._is_master = multiprocessing.Value("d", 0)
         self._agent_update_context = None
         self._etcd_watcher = None
         self._etcd_watcher_thread = None
@@ -344,8 +387,6 @@ class CalicoMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
         # * the queue contains tuples (priority, <status key>); we use a
         #   higher priority for events and a lower priority for snapshot
         #   keys, so that current data skips the queue.
-        self._port_status_queue = PriorityQueue()
-        self._port_status_queue_too_long = False
 
         # RPC client for fanning out agent state reports.
         self.state_report_rpc = None
@@ -376,51 +417,168 @@ class CalicoMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
                            events.AFTER_INIT,
                            cancellable=True)
 
+    def _init_and_start_calico_resouce_syncer(self):
+        """Initialize and start CalicoSyncerWorker
+
+        CalicoSyncerWorker will be started in its own process, and thus
+        resources will need to be created.
+        """
+        # Init the DB. We need to create a new connection to the deatabase
+        # in the new process.
+        self.db = None
+        self._get_db()
+
+        # Similarly, create a Keystone client.
+        authcfg = cfg.CONF.keystone_authtoken
+        LOG.debug("authcfg = %r", authcfg)
+        for key in authcfg:
+            if "password" in key:
+                LOG.debug("authcfg[%s] = %s", key, "***")
+            else:
+                LOG.debug("authcfg[%s] = %s", key, authcfg[key])
+
+        auth = v3.Password(
+            user_domain_name=authcfg.user_domain_name,
+            username=authcfg.username,
+            password=authcfg.password,
+            project_domain_name=authcfg.project_domain_name,
+            project_name=authcfg.project_name,
+            auth_url=re.sub(r"/v3/?$", "", authcfg.auth_url) + "/v3",
+        )
+        sess = session.Session(auth=auth)
+        keystone_client = KeystoneClient(session=sess)
+        LOG.debug("Keystone client = %r", keystone_client)
+
+        self.subnet_syncer = SubnetSyncer(self.db, self._txn_from_context)
+        self.policy_syncer = PolicySyncer(self.db, self._txn_from_context)
+        self.endpoint_syncer = WorkloadEndpointSyncer(
+            self.db, self._txn_from_context, self.policy_syncer, keystone_client
+        )
+
+        self.periodic_resync_thread = \
+            self.native_threading.Thread(
+                target=self.do_periodic_resync, daemon=True)
+        self.resync_monitor_thread = \
+            self.native_threading.Thread(
+                target=self.monitor_resync, daemon=True)
+
+        self.periodic_resync_thread.start()
+        self.resync_monitor_thread.start()
+
+        LOG.info("Started Calico Resource Syncer.")
+
+    def _init_and_start_calico_manager(self):
+        # Elector, for performing leader election.
+        self.elector = Elector(
+            cfg.CONF.calico.elector_name,
+            datamodel_v2.neutron_election_key(
+                calico_config.get_region_string()
+            ),
+            self._is_master,
+            old_key=datamodel_v1.NEUTRON_ELECTION_KEY,
+            interval=MASTER_REFRESH_INTERVAL,
+            ttl=MASTER_TIMEOUT,
+        )
+
+        self.election_thread = \
+            self.native_threading.Thread(
+                target=self.elector.run, daemon=True)
+        self.periodic_compaction_thread = \
+            self.native_threading.Thread(
+                target=self.do_periodic_compaction, daemon=True)
+        self.election_thread.start()
+        self.periodic_compaction_thread.start()
+
+        LOG.info("Started Calico Manager.")
+
+    def _init_and_start_agent_status_watcher(self):
+        self.db = None
+        self._get_db()
+
+        # Admin context used by (only) the thread that updates Felix agent
+        # status.
+        self._agent_update_context = ctx.get_admin_context()
+
+        # Get RPC connection for fanning out Felix state reports.
+        try:
+            state_report_topic = topics.REPORTS
+        except AttributeError:
+            # Older versions of OpenStack share the PLUGIN topic.
+            state_report_topic = topics.PLUGIN
+        self.state_report_rpc = agent_rpc.PluginReportStateAPI(state_report_topic)
+
+        native_queue = eventlet.patcher.original("queue")
+        self._port_status_queue = native_queue.PriorityQueue()
+        self._port_status_queue_too_long = False
+
+        self.agent_status_watcher_thread = \
+            self.native_threading.Thread(
+                target=self._status_updating_thread, daemon=True)
+        self.agent_status_update_thread = \
+            self.native_threading.Thread(
+                target=self._loop_writing_port_statuses, daemon=True)
+        self.agent_status_update_thread2 = \
+            self.native_threading.Thread(
+                target=self._loop_writing_port_statuses, daemon=True)
+
+        self.agent_status_watcher_thread.start()
+        self.agent_status_update_thread.start()
+        self.agent_status_update_thread2.start()
+        LOG.info("Started agent status watcher thread.")
+
+    def _init_and_start_endpoint_status_watcher(self):
+        pass
+
     def post_fork_initialize(self, resource, event, trigger, payload=None):
         trigger_class = get_method_class(trigger)
 
-        if trigger_class == worker.WorkloadEndPointSyncer:
-            LOG.info("Initializing WorkloadEndpointSyncer")
+        worker_mapping = {
+            # worker.CalicoResourceSyncerWorker:
+            #     self._init_and_start_calico_resouce_syncer,
+            worker.CalicoManagerWorker:
+                self._init_and_start_calico_manager,
+            worker.CalicoAgentStatusWatcherWorker:
+                self._init_and_start_agent_status_watcher,
+            worker.CalicoEndpointStatusWatcherWorker:
+                self._init_and_start_endpoint_status_watcher
+        }
 
-            # Init the DB.
-            self.db = None
-            self._get_db()
-
-            # Create a Keystone client.
-            authcfg = cfg.CONF.keystone_authtoken
-            LOG.debug("authcfg = %r", authcfg)
-            for key in authcfg:
-                if "password" in key:
-                    LOG.debug("authcfg[%s] = %s", key, "***")
-                else:
-                    LOG.debug("authcfg[%s] = %s", key, authcfg[key])
-
-            auth = v3.Password(
-                user_domain_name=authcfg.user_domain_name,
-                username=authcfg.username,
-                password=authcfg.password,
-                project_domain_name=authcfg.project_domain_name,
-                project_name=authcfg.project_name,
-                auth_url=re.sub(r"/v3/?$", "", authcfg.auth_url) + "/v3",
-            )
-            sess = session.Session(auth=auth)
-            keystone_client = KeystoneClient(session=sess)
-            LOG.debug("Keystone client = %r", keystone_client)
-
-            self.subnet_syncer = SubnetSyncer(self.db, self._txn_from_context)
-            self.policy_syncer = PolicySyncer(self.db, self._txn_from_context)
-            self.endpoint_syncer = WorkloadEndpointSyncer(
-                self.db, self._txn_from_context, self.policy_syncer, keystone_client
-            )
-
-            self.native_and_in_another_process_resync_thread = \
-                threading.Thread(target=self.do_periodic_resync)
-
-            LOG.info("Starting the resync thread")
-            self.native_and_in_another_process_resync_thread.start()
+        # No need to lock when initializing as there is just one process
+        # for each worker. Threads are initialized in the callbacks.
+        if trigger_class in worker_mapping:
+            recreate_log_handler_locks_using_native_threading()
+            worker_mapping[trigger_class]()
 
     def get_workers(self):
-        return [worker.WorkloadEndPointSyncer()]
+        """Creates calico workers in separate processes."""
+        return [
+            worker.CalicoResourceSyncerWorker(),
+            worker.CalicoManagerWorker(),
+            worker.CalicoAgentStatusWatcherWorker(),
+        ]
+
+    def is_master(self):
+        """Check whether the current instance of neutron-server is master.
+
+        In order for a neutron-server to be considered as a master, it needs
+        to aquire the election key and actively maintain it.
+        """
+        # We are never elected. We are not the master.
+        if self._is_master.value == 0:
+            return False
+
+        # Else, let's check if we refresh the time within timeout.
+        # If not, there is something wrong with elector!!
+        time_till_last_refreshed = self._is_master.value - time.time()
+        is_master = time_till_last_refreshed < MASTER_TIMEOUT
+
+        if not is_master:
+            LOG.warning(
+                "The elector hasn't refreshed the lease in "
+                f"{self._is_master.value - time.time()}s."
+            )
+
+        return is_master
 
     @logging_exceptions(LOG)
     def _post_fork_init(self, voting=False):
@@ -492,61 +650,11 @@ class CalicoMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
             keystone_client = KeystoneClient(session=sess)
             LOG.debug("Keystone client = %r", keystone_client)
 
-            # Create syncers.
-            # self.subnet_syncer = SubnetSyncer(self.db, self._txn_from_context)
-            # self.policy_syncer = PolicySyncer(self.db, self._txn_from_context)
-            # self.endpoint_syncer = WorkloadEndpointSyncer(
-            #     self.db, self._txn_from_context, self.policy_syncer, keystone_client
-            # )
-
-            # Admin context used by (only) the thread that updates Felix agent
-            # status.
-            self._agent_update_context = ctx.get_admin_context()
-
-            # Get RPC connection for fanning out Felix state reports.
-            try:
-                state_report_topic = topics.REPORTS
-            except AttributeError:
-                # Older versions of OpenStack share the PLUGIN topic.
-                state_report_topic = topics.PLUGIN
-            self.state_report_rpc = agent_rpc.PluginReportStateAPI(state_report_topic)
-
-            if voting:
-                # Elector, for performing leader election.
-                self.elector = Elector(
-                    cfg.CONF.calico.elector_name,
-                    datamodel_v2.neutron_election_key(
-                        calico_config.get_region_string()
-                    ),
-                    old_key=datamodel_v1.NEUTRON_ELECTION_KEY,
-                    interval=MASTER_REFRESH_INTERVAL,
-                    ttl=MASTER_TIMEOUT,
-                )
-                LOG.info(
-                    "PID %s: Initializing Calico Elector; "
-                    "this process WILL participate in leader election.",
-                    current_pid,
-                )
-
-                # Start our resynchronization process and status updating. Just in
-                # case we ever get two same threads running, use an epoch counter
-                # to tell the old thread to die.
-                # We deliberately do this last, to ensure that all of the setup
-                # above is complete before we start running.
-                self._epoch += 1
-                # eventlet.spawn(self.resync_monitor_thread, self._epoch)
-                # eventlet.spawn(self.periodic_resync_thread, self._epoch)
-                if cfg.CONF.calico.etcd_compaction_period_mins > 0:
-                    eventlet.spawn(self.periodic_compaction_thread, self._epoch)
-                eventlet.spawn(self._status_updating_thread, self._epoch)
-                for _ in range(cfg.CONF.calico.num_port_status_threads):
-                    eventlet.spawn(self._loop_writing_port_statuses, self._epoch)
-            else:
-                LOG.info(
-                    "PID %s: Not a voting participant; "
-                    "skipping elector and leader threads.",
-                    current_pid,
-                )
+            self.subnet_syncer = SubnetSyncer(self.db, self._txn_from_context)
+            self.policy_syncer = PolicySyncer(self.db, self._txn_from_context)
+            self.endpoint_syncer = WorkloadEndpointSyncer(
+                self.db, self._txn_from_context, self.policy_syncer, keystone_client
+            )
 
             self._my_pid = current_pid
 
@@ -555,7 +663,7 @@ class CalicoMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
             )
 
     @logging_exceptions(LOG)
-    def _status_updating_thread(self, expected_epoch):
+    def _status_updating_thread(self):
         """_status_updating_thread
 
         This method acts as a status updates handler logic for the
@@ -564,9 +672,9 @@ class CalicoMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
         """
         TrackTask("STATUS_UPDATING")
         LOG.info("Status updating thread started.")
-        while self._epoch == expected_epoch:
+        while True:
             # Only handle updates if we are the master node.
-            if self.elector.master():
+            if self.is_master():
                 if self._etcd_watcher is None:
                     LOG.info("Became the master, starting StatusWatcher")
                     self._etcd_watcher = StatusWatcher(self)
@@ -575,7 +683,10 @@ class CalicoMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
                         TrackTask("STATUS_ETCD_WATCHER")
                         self._etcd_watcher.start()
 
-                    self._etcd_watcher_thread = eventlet.spawn(start_etcd_watcher)
+                    self._etcd_watcher_thread = \
+                        self.native_threading.Thread(
+                            target=start_etcd_watcher, daemon=True)
+                    self._etcd_watcher_thread.start()
                     LOG.info(
                         "Started %s as %s",
                         self._etcd_watcher,
@@ -592,7 +703,7 @@ class CalicoMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
                     self._etcd_watcher = None
                 # Short sleep interval before we check if we've become
                 # the master.
-            eventlet.sleep(MASTER_CHECK_INTERVAL_SECS)
+            time.sleep(MASTER_CHECK_INTERVAL_SECS)
         else:
             LOG.warning(
                 "Unexpected: epoch changed. Handling status updates thread exiting."
@@ -696,19 +807,16 @@ class CalicoMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
                     LOG.warning("Port status update queue length is high: %s", qsize)
                     self._last_status_queue_log_time = now
                     self._port_status_queue_too_long = True
-                # Queue is getting large, make sure the DB writer threads
-                # get CPU.
-                eventlet.sleep()
             elif self._port_status_queue_too_long and qsize < 5:
                 self._port_status_queue_too_long = False
                 LOG.warning("Port status update queue back to normal: %s", qsize)
 
     @logging_exceptions(LOG)
-    def _loop_writing_port_statuses(self, expected_epoch):
+    def _loop_writing_port_statuses(self):
         TrackTask("PORT_STATUS_WRITE")
-        LOG.info("Port status write thread started epoch=%s", expected_epoch)
+        LOG.info("Port status write thread started")
         admin_context = ctx.get_admin_context()
-        while self._epoch == expected_epoch:
+        while True:
             # Wait for work to do.
             _, port_status_key = self._port_status_queue.get()
             # Actually do the update.  Catch all exceptions to avoid
@@ -903,7 +1011,7 @@ class CalicoMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
         # For each port, recompute and emit the WorkloadEndpoint for that port.
         LOG.info("Update %d port(s) for %s", len(ports), reason)
         for p in ports:
-            if _port_is_endpoint_port(p):
+            if _port_is_endpoint_port(p) and self.endpoint_syncer:
                 self.endpoint_syncer.write_endpoint(p, plugin_context, must_update=True)
 
     @requires_state
@@ -1294,7 +1402,7 @@ class CalicoMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
             LOG.info("Port unbound, attempting delete if needed.")
             self.endpoint_syncer.delete_endpoint(port)
 
-    def resync_monitor_thread(self, launch_epoch):
+    def monitor_resync(self):
         """Monitor the interval between completed resyncs.
 
         Logs an error if the periodic resync duration surpasses
@@ -1303,9 +1411,9 @@ class CalicoMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
         try:
             LOG.info("Resync monitor thread started")
 
-            while self._epoch == launch_epoch:
+            while True:
                 # Only monitor the resync if we are the master node.
-                if self.elector.master():
+                if self.is_master():
                     LOG.info("I am master: monitoring periodic resync")
 
                     curr_time = datetime.now()
@@ -1325,16 +1433,13 @@ class CalicoMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
                     time_left = (deadline - curr_time).total_seconds()
                     polling_rate = cfg.CONF.calico.resync_max_interval_secs / 5
                     sleep_time = time_left if deadline > curr_time else polling_rate
-                    eventlet.sleep(sleep_time)
+                    time.sleep(sleep_time)
                 else:
-                    LOG.debug("I am not master")
-                    eventlet.sleep(MASTER_CHECK_INTERVAL_SECS)
+                    LOG.info("I am not master")
+                    time.sleep(MASTER_CHECK_INTERVAL_SECS)
         except Exception:
             # TODO(nj) Should we tear down the process.
             LOG.exception("Resync monitor thread died!")
-            if self.elector:
-                # Stop the elector so that we give up the mastership.
-                self.elector.stop()
             raise
 
     def do_periodic_resync(self):
@@ -1348,53 +1453,60 @@ class CalicoMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
         try:
             LOG.info("Periodic resync thread started")
             while True:
-                LOG.info("Doing periodic resync")
-                start_time = datetime.now()
+                # Only do the resync if we are the master node.
+                if self.is_master():
+                    LOG.info("I am master: doing periodic resync")
+                    start_time = datetime.now()
 
-                # Since this thread is not associated with any particular
-                # request, we use our own admin context for accessing the
-                # database.
-                admin_context = ctx.get_admin_context()
+                    # Since this thread is not associated with any particular
+                    # request, we use our own admin context for accessing the
+                    # database.
+                    admin_context = ctx.get_admin_context()
 
-                try:
-                    # Resync subnets.
-                    self.subnet_syncer.resync(admin_context)
+                    try:
+                        # Resync subnets.
+                        self.subnet_syncer.resync(admin_context)
 
-                    # Resync policies.  Do this before endpoints because
-                    # it's worse to have incorrect or missing policy for a
-                    # known endpoint, than it is to have a briefly
-                    # incorrect or missing endpoint.
-                    self.policy_syncer.resync(admin_context)
+                        # Resync policies.  Do this before endpoints because
+                        # it's worse to have incorrect or missing policy for a
+                        # known endpoint, than it is to have a briefly
+                        # incorrect or missing endpoint.
+                        self.policy_syncer.resync(admin_context)
 
-                    # Resync endpoints.
-                    self.endpoint_syncer.resync(admin_context)
+                        # Resync endpoints.
+                        self.endpoint_syncer.resync(admin_context)
 
-                    # Resync ClusterInformation and FelixConfiguration.
-                    self.provide_felix_config()
+                        # Resync ClusterInformation and FelixConfiguration.
+                        self.provide_felix_config()
 
-                    # mark this resync as finished.
-                    self.last_resync_time = datetime.now()
-                    LOG.info(
-                        "The periodic resync finished after"
-                        f" {self.last_resync_time - start_time}"
-                    )
-                except Exception:
-                    LOG.exception("Error in periodic resync thread.")
+                        # mark this resync as finished.
+                        self.last_resync_time = datetime.now()
+                        LOG.info(
+                            "The periodic resync finished after"
+                            f" {self.last_resync_time - start_time}"
+                        )
+                    except Exception:
+                        LOG.exception("Error in periodic resync thread.")
 
-                if cfg.CONF.calico.resync_interval_secs == 0:
-                    # No continuing periodic resync.
-                    break
+                    if cfg.CONF.calico.resync_interval_secs == 0:
+                        # No continuing periodic resync.
+                        break
 
-                # Take a nice nap, in new process and new threads :D
-                time.sleep(cfg.CONF.calico.resync_interval_secs)
-
+                    # Take a nice nap, in new process and new threads :D
+                    time.sleep(cfg.CONF.calico.resync_interval_secs)
+                else:
+                    # Shorter sleep interval before we check if we've become
+                    # the master.  Avoids waiting a whole resync_interval_secs
+                    # if we just miss the master update.
+                    LOG.info("I am not master")
+                    time.sleep(MASTER_CHECK_INTERVAL_SECS)
         except Exception:
             # TODO(nj) Should we tear down the process.
             LOG.exception("Periodic resync thread died!")
         else:
             LOG.warning("Periodic resync thread exiting.")
 
-    def periodic_compaction_thread(self, launch_epoch):
+    def do_periodic_compaction(self):
         """Periodic etcd compaction logic.
 
         On a fixed interval, requests etcd compaction to prevent unbounded disk usage
@@ -1403,9 +1515,9 @@ class CalicoMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
         TrackTask("COMPACTION")
         try:
             LOG.info("Periodic compaction thread started")
-            while self._epoch == launch_epoch:
+            while True:
                 # Only do the compaction if we are the master node.
-                if self.elector.master():
+                if self.is_master():
                     LOG.info("I am master: doing periodic compaction")
 
                     try:
@@ -1415,13 +1527,13 @@ class CalicoMechanismDriver(mech_agent.SimpleAgentMechanismDriverBase):
                         LOG.exception("Error in periodic compaction thread")
 
                     # Reschedule ourselves.
-                    eventlet.sleep(60 * cfg.CONF.calico.etcd_compaction_period_mins)
+                    time.sleep(60 * cfg.CONF.calico.etcd_compaction_period_mins)
                 else:
                     # Shorter sleep interval before we check if we've become the master.
                     # Avoids waiting a whole etcd_compaction_period_mins if we just miss
                     # the master update.
                     LOG.debug("I am not master")
-                    eventlet.sleep(MASTER_CHECK_INTERVAL_SECS)
+                    time.sleep(MASTER_CHECK_INTERVAL_SECS)
         except Exception:
             # TODO(nj) Should we tear down the process.
             LOG.exception("Periodic compaction thread died!")
